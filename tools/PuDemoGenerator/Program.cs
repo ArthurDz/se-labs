@@ -249,8 +249,8 @@ public static class Program
     {
         Console.WriteLine();
         Console.WriteLine("--- Требуется настройка спринтов ------------------------------");
-        Console.WriteLine($"1. Откройте https://github.com/orgs/{_org}/projects/{_projectNumber}/settings/fields");
-        Console.WriteLine("2. Откройте поле Iteration и задайте три спринта:");
+        Console.WriteLine($"1. Откройте https://github.com/orgs/{_org}/projects/{_projectNumber}/settings");
+        Console.WriteLine("2. В разделе Fields выберите поле Iteration и задайте три спринта:");
         Console.WriteLine("     Sprint 1 — завершившийся (две недели назад)");
         Console.WriteLine("     Sprint 2 — текущий");
         Console.WriteLine("     Sprint 3 — следующий");
