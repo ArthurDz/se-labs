@@ -15,6 +15,7 @@ public static class Program
     private static string _login = "";
     private static string _projectId = "";
     private static int _projectNumber;
+    private static readonly Dictionary<string, Issue> _existing = new();
 
     /// <summary>Синонимы названий статусов в разных шаблонах досок.</summary>
     private static readonly Dictionary<string, string[]> StatusAliases = new(StringComparer.OrdinalIgnoreCase)
@@ -210,6 +211,31 @@ public static class Program
 
     private static async Task CopyProjectAsync(int sourceNumber, string title)
     {
+        // Повторный запуск не должен плодить проекты: если проект с таким именем уже есть — берём его.
+        var existing = await _gh.GraphQlAsync(
+            """
+            query($org: String!) {
+              organization(login: $org) {
+                projectsV2(first: 50) { nodes { id number title url } }
+              }
+            }
+            """,
+            new { org = _org });
+
+        foreach (var node in existing.GetProperty("organization").GetProperty("projectsV2")
+                     .GetProperty("nodes").EnumerateArray())
+        {
+            if (!string.Equals(node.GetProperty("title").GetString(), title, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            _projectId = node.GetProperty("id").GetString()!;
+            _projectNumber = node.GetProperty("number").GetInt32();
+            Step($"Используется существующий проект «{title}»: {node.GetProperty("url").GetString()}");
+            return;
+        }
+
         var data = await _gh.GraphQlAsync(
             """
             query($org: String!, $number: Int!) {
@@ -382,10 +408,20 @@ public static class Program
                 ... on ProjectV2 {
                   fields(first: 50) {
                     nodes {
-                      ... on ProjectV2Field { id name dataType }
+                      ... on ProjectV2Field {
+                        id name dataType isIssueField
+                        issueField {
+                          ... on IssueFieldNumber { id }
+                          ... on IssueFieldText { id }
+                          ... on IssueFieldDate { id }
+                        }
+                      }
                       ... on ProjectV2IterationField { id name dataType }
                       ... on ProjectV2SingleSelectField {
-                        id name dataType options { id name }
+                        id name dataType isIssueField options { id name }
+                        issueField {
+                          ... on IssueFieldSingleSelect { id options { id name } }
+                        }
                       }
                     }
                   }
@@ -410,7 +446,27 @@ public static class Program
             }
 
             var name = nameProp.GetString()!;
-            result[name] = new ProjectField(node.GetProperty("id").GetString()!, name, options);
+
+            // Часть полей GitHub перенёс на уровень issue: их значения пишутся
+            // мутацией setIssueFieldValue, а не updateProjectV2ItemFieldValue.
+            var isIssueField = node.TryGetProperty("isIssueField", out var flag)
+                               && flag.ValueKind == JsonValueKind.True;
+            string? issueFieldId = null;
+            if (isIssueField && node.TryGetProperty("issueField", out var issueField)
+                             && issueField.ValueKind == JsonValueKind.Object
+                             && issueField.TryGetProperty("id", out var issueFieldIdProp))
+            {
+                issueFieldId = issueFieldIdProp.GetString();
+                if (issueField.TryGetProperty("options", out var issueOptions))
+                {
+                    foreach (var option in issueOptions.EnumerateArray())
+                    {
+                        options[option.GetProperty("name").GetString()!] = option.GetProperty("id").GetString()!;
+                    }
+                }
+            }
+
+            result[name] = new ProjectField(node.GetProperty("id").GetString()!, name, options, issueFieldId);
         }
 
         return result;
@@ -419,6 +475,7 @@ public static class Program
     private static async Task SeedAsync(Dictionary<string, ProjectField> fields, List<Iteration> sprints)
     {
         Console.WriteLine();
+        await LoadExistingIssuesAsync();
         Info("Создание рабочих элементов...");
 
         foreach (var epic in SeedData.Epics)
@@ -464,8 +521,41 @@ public static class Program
         }
     }
 
+    /// <summary>Уже существующие задачи репозитория: нужны, чтобы повторный запуск не создавал дубликаты.</summary>
+    private static async Task LoadExistingIssuesAsync()
+    {
+        _existing.Clear();
+        for (var page = 1; page <= 10; page++)
+        {
+            var issues = await _gh.GetAsync($"repos/{_org}/{_repo}/issues?state=all&per_page=100&page={page}");
+            var count = 0;
+            foreach (var issue in issues.EnumerateArray())
+            {
+                count++;
+                if (issue.TryGetProperty("pull_request", out _)) continue;
+
+                _existing[issue.GetProperty("title").GetString()!] = new Issue(
+                    issue.GetProperty("number").GetInt32(),
+                    issue.GetProperty("id").GetInt64(),
+                    issue.GetProperty("node_id").GetString()!);
+            }
+
+            if (count < 100) break;
+        }
+
+        if (_existing.Count > 0)
+        {
+            Info($"В репозитории уже есть задач: {_existing.Count}, они будут переиспользованы");
+        }
+    }
+
     private static async Task<Issue> CreateIssueAsync(string title, string body, string type, string[] labels)
     {
+        if (_existing.TryGetValue(title, out var known))
+        {
+            return known;
+        }
+
         var payload = new Dictionary<string, object>
         {
             ["title"] = title,
@@ -480,14 +570,17 @@ public static class Program
         }
 
         var issue = await _gh.PostAsync($"repos/{_org}/{_repo}/issues", payload);
-        return new Issue(
+        var created = new Issue(
             issue.GetProperty("number").GetInt32(),
             issue.GetProperty("id").GetInt64(),
             issue.GetProperty("node_id").GetString()!);
+        _existing[title] = created;
+        return created;
     }
 
+    /// <summary>Связь «родитель — вложенная задача». Повторная связь игнорируется.</summary>
     private static async Task LinkSubIssueAsync(Issue parent, Issue child) =>
-        await _gh.PostAsync($"repos/{_org}/{_repo}/issues/{parent.Number}/sub_issues",
+        await _gh.TryPostAsync($"repos/{_org}/{_repo}/issues/{parent.Number}/sub_issues",
             new { sub_issue_id = child.Id });
 
     private static async Task CloseIssueAsync(Issue issue) =>
@@ -514,31 +607,32 @@ public static class Program
 
         var itemId = data.GetProperty("addProjectV2ItemById").GetProperty("item").GetProperty("id").GetString()!;
 
-        await SetSingleSelectAsync(itemId, fields, "Status", status);
-        await SetSingleSelectAsync(itemId, fields, "Area", area);
+        var issueNodeId = issue.NodeId;
+        await SetSingleSelectAsync(itemId, issueNodeId, fields, "Status", status);
+        await SetSingleSelectAsync(itemId, issueNodeId, fields, "Area", area);
 
         if (estimate is not null)
         {
-            await SetNumberAsync(itemId, fields, "Estimate", estimate.Value);
+            await SetNumberAsync(itemId, issueNodeId, fields, "Estimate", estimate.Value);
         }
 
         if (task is not null)
         {
-            await SetSingleSelectAsync(itemId, fields, "Activity", task.Value.Activity);
-            await SetNumberAsync(itemId, fields, "Remaining Work", task.Value.Remaining);
+            await SetSingleSelectAsync(itemId, issueNodeId, fields, "Activity", task.Value.Activity);
+            await SetNumberAsync(itemId, issueNodeId, fields, "Remaining Work", task.Value.Remaining);
         }
 
         if (sprint is not null && int.TryParse(sprint, out var index) && index <= sprints.Count)
         {
             var iteration = sprints[index - 1];
             await SetIterationAsync(itemId, iteration);
-            await SetDateAsync(itemId, fields, "Start date", iteration.StartDate);
-            await SetDateAsync(itemId, fields, "Target date", iteration.EndDate);
+            await SetDateAsync(itemId, issueNodeId, fields, "Start date", iteration.StartDate);
+            await SetDateAsync(itemId, issueNodeId, fields, "Target date", iteration.EndDate);
         }
     }
 
     private static async Task SetSingleSelectAsync(
-        string itemId, Dictionary<string, ProjectField> fields, string fieldName, string optionName)
+        string itemId, string issueNodeId, Dictionary<string, ProjectField> fields, string fieldName, string optionName)
     {
         if (!fields.TryGetValue(fieldName, out var field)) return;
         if (!field.Options.TryGetValue(optionName, out var optionId))
@@ -554,6 +648,16 @@ public static class Program
             optionId = field.Options[match];
         }
 
+        if (field.IssueFieldId is not null)
+        {
+            await SetIssueFieldAsync(issueNodeId, new
+            {
+                fieldId = field.IssueFieldId,
+                singleSelectOptionId = optionId,
+            });
+            return;
+        }
+
         await _gh.GraphQlAsync(
             """
             mutation($project: ID!, $item: ID!, $field: ID!, $value: String!) {
@@ -567,9 +671,15 @@ public static class Program
     }
 
     private static async Task SetNumberAsync(
-        string itemId, Dictionary<string, ProjectField> fields, string fieldName, double value)
+        string itemId, string issueNodeId, Dictionary<string, ProjectField> fields, string fieldName, double value)
     {
         if (!fields.TryGetValue(fieldName, out var field)) return;
+
+        if (field.IssueFieldId is not null)
+        {
+            await SetIssueFieldAsync(issueNodeId, new { fieldId = field.IssueFieldId, numberValue = value });
+            return;
+        }
 
         await _gh.GraphQlAsync(
             """
@@ -583,9 +693,19 @@ public static class Program
     }
 
     private static async Task SetDateAsync(
-        string itemId, Dictionary<string, ProjectField> fields, string fieldName, DateOnly value)
+        string itemId, string issueNodeId, Dictionary<string, ProjectField> fields, string fieldName, DateOnly value)
     {
         if (!fields.TryGetValue(fieldName, out var field)) return;
+
+        if (field.IssueFieldId is not null)
+        {
+            await SetIssueFieldAsync(issueNodeId, new
+            {
+                fieldId = field.IssueFieldId,
+                dateValue = value.ToString("yyyy-MM-dd"),
+            });
+            return;
+        }
 
         await _gh.GraphQlAsync(
             """
@@ -597,6 +717,18 @@ public static class Program
             """,
             new { project = _projectId, item = itemId, field = field.Id, value = value.ToString("yyyy-MM-dd") });
     }
+
+    /// <summary>Запись значения поля, которое GitHub хранит на уровне issue.</summary>
+    private static async Task SetIssueFieldAsync(string issueNodeId, object issueField) =>
+        await _gh.GraphQlAsync(
+            """
+            mutation($issue: ID!, $fields: [IssueFieldCreateOrUpdateInput!]!) {
+              setIssueFieldValue(input: {issueId: $issue, issueFields: $fields}) {
+                issue { id }
+              }
+            }
+            """,
+            new { issue = issueNodeId, fields = new[] { issueField } });
 
     private static async Task SetIterationAsync(string itemId, Iteration iteration) =>
         await _gh.GraphQlAsync(
@@ -612,6 +744,10 @@ public static class Program
 
 public sealed record Issue(int Number, long Id, string NodeId);
 
-public sealed record ProjectField(string Id, string Name, Dictionary<string, string> Options);
+public sealed record ProjectField(
+    string Id,
+    string Name,
+    Dictionary<string, string> Options,
+    string? IssueFieldId = null);
 
 public sealed record Iteration(string Id, string Title, DateOnly StartDate, DateOnly EndDate, string FieldId);
